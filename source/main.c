@@ -1,219 +1,204 @@
-#include "resolve.h"
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <stdarg.h>
+#include <sys/stat.h>
+#include <sys/ioctl.h>
 
-int netdbg_sock;
+#include <ps5/kernel.h>
 
-void printf_notification(const char* fmt, ...) {
-    SceNotificationRequest noti_buffer;
+/* Full PS5 notification struct (Size = 0xC30) */
+typedef struct {
+    int type;                // 0x00
+    int req_id;              // 0x04
+    int priority;            // 0x08
+    int msg_id;              // 0x0C
+    int target_id;           // 0x10
+    int user_id;             // 0x14
+    int unk1;                // 0x18
+    int unk2;                // 0x1C
+    int app_id;              // 0x20
+    int error_num;           // 0x24
+    int unk3;                // 0x28
+    char use_icon_image_uri; // 0x2C
+    char message[1024];      // 0x2D
+    char uri[1024];          // 0x42D
+    char unkstr[1024];       // 0x82D
+} SceNotificationRequest;
 
-    va_list args;
-    va_start(args, fmt);
-    f_vsprintf(noti_buffer.message, fmt, args);
-    va_end(args);
+int sceKernelSendNotificationRequest(int device, SceNotificationRequest *req, size_t size, int blocking);
 
-    noti_buffer.type = 0;
-    noti_buffer.unk3 = 0;
-    noti_buffer.use_icon_image_uri = 1;
-    noti_buffer.target_id = -1;
-    f_strcpy(noti_buffer.uri, "cxml://psnotification/tex_icon_system");
+void printf_notification(const char *fmt, ...)
+{
+    SceNotificationRequest noti;
+    memset(&noti, 0, sizeof(noti));
 
-    f_sceKernelSendNotificationRequest(0, (SceNotificationRequest * ) & noti_buffer, sizeof(noti_buffer), 0);
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(noti.message, sizeof(noti.message), fmt, ap);
+    va_end(ap);
+
+    noti.type = 0;
+    noti.use_icon_image_uri = 1;
+    noti.target_id = -1;
+    strncpy(noti.uri, "cxml://psnotification/tex_icon_system", sizeof(noti.uri) - 1);
+
+    sceKernelSendNotificationRequest(0, &noti, sizeof(noti), 0);
+    printf("%s\n", noti.message);
 }
 
-struct ioctl_C0105203_args
-{
-  void* buffer;
-  int size;
-  int error;
+// Struct definition for /dev/rnps ioctl
+struct ioctl_C0105203_args {
+    void* buffer;
+    int size;
+    int error;
 };
 
-int rnps_decrypt_block(void* buffer, int size)
-{
-  int handle = f_open("/dev/rnps", 2);
-  if (handle < 0)
-  {
-    return 0x800F1213;
-  }
-  struct ioctl_C0105203_args args;
-  args.buffer = buffer;
-  args.size = size;
-  args.error = 0x800F1225;
-  int error;
-  if (f_ioctl(handle, 0xC0105203, &args) < 0)
-  {
-    return -1;
-  }
-  else
-  {
-    error = args.error;
-  }
-  f_close(handle);
-  return error;
+int rnps_decrypt_block(void* buffer, int size) {
+    int handle = open("/dev/rnps", O_RDWR);
+    if (handle < 0) {
+        printf_notification("Failed to open /dev/rnps");
+        return 0x800F1213;
+    }
+
+    struct ioctl_C0105203_args args = {
+        .buffer = buffer,
+        .size = size,
+        .error = 0x800F1225
+    };
+
+    int error = 0;
+    if (ioctl(handle, 0xC0105203, &args) < 0) {
+        error = -1;
+    } else {
+        error = args.error;
+    }
+
+    close(handle);
+    return error;
 }
 
-int decrypt (char* input, char* output){
-	int fd=f_open(input, O_RDONLY, 0777);
-	
-	printf_notification("open %08X", fd);
-    
-    unsigned char * buf = (unsigned char*) f_malloc(0x10000000);
-    
-    unsigned int size = f_read(fd,buf,0x10000000);
-	
-	printf_notification("size %08X", size);
-    
-    f_close(fd);
-    
-    int res = rnps_decrypt_block(buf,size);
-	
-	printf_notification("res %08X", res);
+int decrypt(const char* input, const char* output) {
+    int fd = open(input, O_RDONLY, 0);
+    if (fd < 0) {
+        printf_notification("Failed to open input: %s", input);
+        return -1;
+    }
 
-    fd = f_open(output, O_WRONLY | O_CREAT | O_TRUNC, 0644);
-    
-    int written = f_write(fd,buf,size);
+    struct stat st;
+    if (fstat(fd, &st) < 0) {
+        printf_notification("Failed to stat: %s", input);
+        close(fd);
+        return -1;
+    }
 
-	printf_notification("written %08X", written);
-	
-	return 0;
-	
+    size_t size = st.st_size;
+    if (size == 0) {
+        printf_notification("File empty: %s", input);
+        close(fd);
+        return -1;
+    }
+
+    unsigned char* buf = (unsigned char*)malloc(size);
+    if (!buf) {
+        printf_notification("Alloc failed (%zu bytes)", size);
+        close(fd);
+        return -1;
+    }
+
+    ssize_t read_bytes = read(fd, buf, size);
+    close(fd);
+
+    if (read_bytes != (ssize_t)size) {
+        printf_notification("Read error: %s", input);
+        free(buf);
+        return -1;
+    }
+
+    int res = rnps_decrypt_block(buf, size);
+    printf_notification("Decrypted res: %08X", res);
+
+    if (res < 0) {
+        free(buf);
+        return res;
+    }
+
+    fd = open(output, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0) {
+        printf_notification("Failed output open: %s", output);
+        free(buf);
+        return -1;
+    }
+
+    ssize_t written = write(fd, buf, size);
+    close(fd);
+    free(buf);
+
+    printf_notification("Wrote %zd bytes to %s", written, output);
+    return 0;
 }
 
-int payload_main(struct payload_args *args) {
-    dlsym_t* dlsym = args->dlsym;
-	
-	int libKernel = 0x2001;
+int main(int argc, char *argv[]) {
 
-	dlsym(libKernel, "sceKernelLoadStartModule", &f_sceKernelLoadStartModule);
-	dlsym(libKernel, "sceKernelDebugOutText", &f_sceKernelDebugOutText);
-	dlsym(libKernel, "sceKernelSendNotificationRequest", &f_sceKernelSendNotificationRequest);
-	dlsym(libKernel, "sceKernelUsleep", &f_sceKernelUsleep);
-	dlsym(libKernel, "scePthreadMutexLock", &f_scePthreadMutexLock);
-	dlsym(libKernel, "scePthreadMutexUnlock", &f_scePthreadMutexUnlock);
-	dlsym(libKernel, "scePthreadExit", &f_scePthreadExit);
-	dlsym(libKernel, "scePthreadMutexInit", &f_scePthreadMutexInit);
-	dlsym(libKernel, "scePthreadCreate", &f_scePthreadCreate);
-	dlsym(libKernel, "scePthreadMutexDestroy", &f_scePthreadMutexDestroy);
-	dlsym(libKernel, "scePthreadJoin", &f_scePthreadJoin);
-	dlsym(libKernel, "socket", &f_socket);
-	dlsym(libKernel, "bind", &f_bind);
-	dlsym(libKernel, "listen", &f_listen);
-	dlsym(libKernel, "accept", &f_accept);
-	dlsym(libKernel, "ioctl", &f_ioctl);
-	dlsym(libKernel, "open", &f_open);
-	dlsym(libKernel, "read", &f_read);
-	dlsym(libKernel, "write", &f_write);
-	dlsym(libKernel, "close", &f_close);
-	dlsym(libKernel, "stat", &f_stat);
-	dlsym(libKernel, "fstat", &f_fstat);
-	dlsym(libKernel, "rename", &f_rename);
-	dlsym(libKernel, "rmdir", &f_rmdir);
-	dlsym(libKernel, "mkdir", &f_mkdir);
-	dlsym(libKernel, "getdents", &f_getdents);
-	dlsym(libKernel, "unlink", &f_unlink);
-	dlsym(libKernel, "readlink", &f_readlink);
-	dlsym(libKernel, "lseek", &f_lseek);
-	dlsym(libKernel, "puts", &f_puts);
-	dlsym(libKernel, "mmap", &f_mmap);
-	dlsym(libKernel, "munmap", &f_munmap);
-	dlsym(libKernel, "__error", &f___error);
+    /* Group 1 */
+    /*
+    decrypt("/system_ex/rnps/apps/NPXS40002/application.ps.bundle", "/data/NPXS40002.bin");
+    decrypt("/system_ex/rnps/apps/NPXS40003/application.ps.bundle", "/data/NPXS40003.bin");
+    */
+    decrypt("/system_ex/rnps/apps/NPXS40008/application.ps.bundle", "/data/NPXS40008.bin");
+    /*
+    decrypt("/system_ex/rnps/apps/NPXS40009/application.ps.bundle", "/data/NPXS40009.bin");
+    */
 	
+    /* Group 2 */
+    /*
+    decrypt("/system_ex/rnps/apps/NPXS40013/application.ps.bundle", "/data/NPXS40013.bin");
+    decrypt("/system_ex/rnps/apps/NPXS40015/application.ps.bundle", "/data/NPXS40015.bin");
+    decrypt("/system_ex/rnps/apps/NPXS40016/application.ps.bundle", "/data/NPXS40016.bin");
+    */
+	
+    /* Group 3 */
+    /*
+    decrypt("/system_ex/rnps/apps/NPXS40018/application.ps.bundle", "/data/NPXS40018.bin");
+    decrypt("/system_ex/rnps/apps/NPXS40021/application.ps.bundle", "/data/NPXS40021.bin");
+    decrypt("/system_ex/rnps/apps/NPXS40027/application.ps.bundle", "/data/NPXS40027.bin");
+    decrypt("/system_ex/rnps/apps/NPXS40032/application.ps.bundle", "/data/NPXS40032.bin");
+    */
 
-	int libNet = f_sceKernelLoadStartModule("libSceNet.sprx", 0, 0, 0, 0, 0);
-	dlsym(libNet, "sceNetSocket", &f_sceNetSocket);
-	dlsym(libNet, "sceNetConnect", &f_sceNetConnect);
-	dlsym(libNet, "sceNetHtons", &f_sceNetHtons);
-	dlsym(libNet, "sceNetAccept", &f_sceNetAccept);
-	dlsym(libNet, "sceNetSend", &f_sceNetSend);
-	dlsym(libNet, "sceNetInetNtop", &f_sceNetInetNtop);
-	dlsym(libNet, "sceNetSocketAbort", &f_sceNetSocketAbort);
-	dlsym(libNet, "sceNetBind", &f_sceNetBind);
-	dlsym(libNet, "sceNetListen", &f_sceNetListen);
-	dlsym(libNet, "sceNetSocketClose", &f_sceNetSocketClose);
-	dlsym(libNet, "sceNetHtonl", &f_sceNetHtonl);
-	dlsym(libNet, "sceNetInetPton", &f_sceNetInetPton);
-	dlsym(libNet, "sceNetGetsockname", &f_sceNetGetsockname);
-	dlsym(libNet, "sceNetRecv", &f_sceNetRecv);
-	dlsym(libNet, "sceNetErrnoLoc", &f_sceNetErrnoLoc);
-	dlsym(libNet, "sceNetSetsockopt", &f_sceNetSetsockopt);
+    /* Group 4 */
+    /*
+    decrypt("/system_ex/rnps/apps/NPXS40033/application.ps.bundle", "/data/NPXS40033.bin");
+    decrypt("/system_ex/rnps/apps/NPXS40036/application.ps.bundle", "/data/NPXS40036.bin");
+    decrypt("/system_ex/rnps/apps/NPXS40037/application.ps.bundle", "/data/NPXS40037.bin");
+    decrypt("/system_ex/rnps/apps/NPXS40041/application.ps.bundle", "/data/NPXS40041.bin");
+    */
 
-	int libC = f_sceKernelLoadStartModule("libSceLibcInternal.sprx", 0, 0, 0, 0, 0);
-	dlsym(libC, "vsprintf", &f_vsprintf);
-	dlsym(libC, "memset", &f_memset);
-	dlsym(libC, "memalign", &f_memalign);
-	dlsym(libC, "sprintf", &f_sprintf);
-	dlsym(libC, "snprintf", &f_snprintf);
-	dlsym(libC, "snprintf_s", &f_snprintf_s);
-	dlsym(libC, "strcat", &f_strcat);
-	dlsym(libC, "free", &f_free);
-	dlsym(libC, "memcpy", &f_memcpy);
-	dlsym(libC, "strcpy", &f_strcpy);
-	dlsym(libC, "strncpy", &f_strncpy);
-	dlsym(libC, "sscanf", &f_sscanf);
-	dlsym(libC, "malloc", &f_malloc);
-	dlsym(libC, "calloc", &f_calloc);
-	dlsym(libC, "strlen", &f_strlen);
-	dlsym(libC, "strcmp", &f_strcmp);
-	dlsym(libC, "strchr", &f_strchr);
-	dlsym(libC, "strrchr", &f_strrchr);
-	dlsym(libC, "gmtime_s", &f_gmtime_s);
-	dlsym(libC, "time", &f_time);
-	dlsym(libC, "localtime", &f_localtime);
-	dlsym(libC, "strerror", &f_strerror);
-	
-	int libNetCtl = f_sceKernelLoadStartModule("libSceNetCtl.sprx", 0, 0, 0, 0, 0);
-	dlsym(libNetCtl, "sceNetCtlInit", &f_sceNetCtlInit);
-	dlsym(libNetCtl, "sceNetCtlTerm", &f_sceNetCtlTerm);
-	dlsym(libNetCtl, "sceNetCtlGetInfo", &f_sceNetCtlGetInfo);
-	
-	/*
-	decrypt("/system_ex/rnps/apps/NPXS40002/application.ps.bundle","/data/NPXS40002.bin");
-	decrypt("/system_ex/rnps/apps/NPXS40003/application.ps.bundle","/data/NPXS40003.bin");
-	decrypt("/system_ex/rnps/apps/NPXS40008/application.ps.bundle","/data/NPXS40008.bin");
-	decrypt("/system_ex/rnps/apps/NPXS40009/application.ps.bundle","/data/NPXS40009.bin");
-	*/
-	
-	
-	decrypt("/system_ex/rnps/apps/NPXS40013/application.ps.bundle","/data/NPXS40013.bin");
-	decrypt("/system_ex/rnps/apps/NPXS40015/application.ps.bundle","/data/NPXS40015.bin");
-	decrypt("/system_ex/rnps/apps/NPXS40016/application.ps.bundle","/data/NPXS40016.bin");
-	
-	
-	/*
-	
-	decrypt("/system_ex/rnps/apps/NPXS40018/application.ps.bundle","/data/NPXS40018.bin");
-	decrypt("/system_ex/rnps/apps/NPXS40021/application.ps.bundle","/data/NPXS40021.bin");
-	decrypt("/system_ex/rnps/apps/NPXS40027/application.ps.bundle","/data/NPXS40027.bin");
-	decrypt("/system_ex/rnps/apps/NPXS40032/application.ps.bundle","/data/NPXS40032.bin");
-	*/
-	
-	/*
-	decrypt("/system_ex/rnps/apps/NPXS40033/application.ps.bundle","/data/NPXS40033.bin");
-	decrypt("/system_ex/rnps/apps/NPXS40036/application.ps.bundle","/data/NPXS40036.bin");
-	decrypt("/system_ex/rnps/apps/NPXS40037/application.ps.bundle","/data/NPXS40037.bin");
-	decrypt("/system_ex/rnps/apps/NPXS40041/application.ps.bundle","/data/NPXS40041.bin");
-	*/
-	
-	/*
-	
-	decrypt("/system_ex/rnps/apps/NPXS40046/application.ps.bundle","/data/NPXS40046.bin");
-	decrypt("/system_ex/rnps/apps/NPXS40047/application.ps.bundle","/data/NPXS40047.bin");
-	decrypt("/system_ex/rnps/apps/NPXS40063/application.ps.bundle","/data/NPXS40063.bin");
-	decrypt("/system_ex/rnps/apps/NPXS40138/application.ps.bundle","/data/NPXS40138.bin");
-	*/
-	
-	/*
-	decrypt("/system_ex/rnps/apps/NPXS40064/application.ps.bundle","/data/NPXS40064.bin");
-	decrypt("/system_ex/rnps/apps/NPXS40071/application.ps.bundle","/data/NPXS40071.bin");
-	decrypt("/system_ex/rnps/apps/NPXS40080/application.ps.bundle","/data/NPXS40080.bin");
-	decrypt("/system_ex/rnps/apps/NPXS40081/application.ps.bundle","/data/NPXS40081.bin");
-	*/
-	/*
-	decrypt("/system_ex/rnps/apps/NPXS40141/base_dll.ps.bundle","/data/NPXS40141.base.bin");
-	decrypt("/system_ex/rnps/apps/NPXS40141/host.ps.bundle","/data/NPXS40141.host.bin");
-	decrypt("/system_ex/rnps/apps/NPXS40154/application.ps.bundle","/data/NPXS40154.bin");
-	decrypt("/system_ex/rnps/apps/NPXS40161/application.ps.bundle","/data/NPXS40161.bin");
-	decrypt("/system_ex/rnps/apps/NPXS40163/application.ps.bundle","/data/NPXS40163.bin");
-	*/
-	
+    /* Group 5 */
+    /*
+    decrypt("/system_ex/rnps/apps/NPXS40046/application.ps.bundle", "/data/NPXS40046.bin");
+    decrypt("/system_ex/rnps/apps/NPXS40047/application.ps.bundle", "/data/NPXS40047.bin");
+    decrypt("/system_ex/rnps/apps/NPXS40063/application.ps.bundle", "/data/NPXS40063.bin");
+    decrypt("/system_ex/rnps/apps/NPXS40138/application.ps.bundle", "/data/NPXS40138.bin");
+    */
 
-  return 0;
+    /* Group 6 */
+    /*
+    decrypt("/system_ex/rnps/apps/NPXS40064/application.ps.bundle", "/data/NPXS40064.bin");
+    decrypt("/system_ex/rnps/apps/NPXS40071/application.ps.bundle", "/data/NPXS40071.bin");
+    decrypt("/system_ex/rnps/apps/NPXS40080/application.ps.bundle", "/data/NPXS40080.bin");
+    decrypt("/system_ex/rnps/apps/NPXS40081/application.ps.bundle", "/data/NPXS40081.bin");
+    */
+
+    /* Group 7 */
+    /*
+    decrypt("/system_ex/rnps/apps/NPXS40141/base_dll.ps.bundle",    "/data/NPXS40141.base.bin");
+    decrypt("/system_ex/rnps/apps/NPXS40141/host.ps.bundle",        "/data/NPXS40141.host.bin");
+    decrypt("/system_ex/rnps/apps/NPXS40154/application.ps.bundle", "/data/NPXS40154.bin");
+    decrypt("/system_ex/rnps/apps/NPXS40161/application.ps.bundle", "/data/NPXS40161.bin");
+    decrypt("/system_ex/rnps/apps/NPXS40163/application.ps.bundle", "/data/NPXS40163.bin");
+    */
+
+    return 0;
 }

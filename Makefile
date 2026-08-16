@@ -1,33 +1,29 @@
-CC      := gcc
-AS      := gcc
-ODIR    := build
-SDIR    := source
-IDIRS   := -I. -Iinclude
-LDIRS   := -L. -Llib
-CFLAGS  := $(IDIRS) -fno-builtin -nostdlib -Wall -m64 -fPIC -mcmodel=small
-SFLAGS  := -fno-builtin -nostartfiles -nostdlib -fPIC -mcmodel=small
-LFLAGS  := $(LDIRS) -Xlinker -T linker.x -Wl,--build-id=none
-CFILES  := $(wildcard $(SDIR)/*.c)
-SFILES  := $(wildcard $(SDIR)/*.s)
-OBJS    := $(patsubst $(SDIR)/%.c, $(ODIR)/%.o, $(CFILES)) $(patsubst $(SDIR)/%.s, $(ODIR)/%.o, $(SFILES))
+PS5_HOST ?= ps5
+PS5_PORT ?= 9021
 
-LIBS :=
+ifdef PS5_PAYLOAD_SDK
+    include $(PS5_PAYLOAD_SDK)/toolchain/prospero.mk
+else
+    $(error PS5_PAYLOAD_SDK is undefined)
+endif
 
-TARGET = decrypt_rnps.elf
+LOADER_OPT ?= -O2
+CFLAGS     += -Wall -Werror
+CPPFLAGS   += -Iinclude -I.
 
-$(TARGET): $(ODIR) $(OBJS)
-	$(CC) crt0.s $(ODIR)/*.o -o $(TARGET) $(CFLAGS) $(LFLAGS) $(LIBS)
+LDFLAGS    += -Wl,-s
 
-$(ODIR)/%.o: $(SDIR)/%.c
-	$(CC) -c -o $@ $< $(CFLAGS)
+SRC := $(wildcard source/*.c) $(wildcard src/*.c)
 
-$(ODIR)/%.o: $(SDIR)/%.s
-	$(AS) -c -o $@ $< $(SFLAGS)
+all: decrypt_rnps.elf
 
-$(ODIR):
-	@mkdir $@
-
-.PHONY: clean
+decrypt_rnps.elf: $(SRC)
+	$(CC) $(CPPFLAGS) $(CFLAGS) $(LOADER_OPT) $(SRC) -o $@ $(LDFLAGS)
 
 clean:
-	rm -f $(shell basename $(CURDIR)).elf $(TARGET) $(ODIR)/*.o
+	rm -f *.o *.elf $(TARGET)
+
+test: decrypt_rnps.elf
+	$(PS5_DEPLOY) -h $(PS5_HOST) -p $(PS5_PORT) $^
+
+.PHONY: all clean test
